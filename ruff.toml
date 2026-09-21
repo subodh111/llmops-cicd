@@ -1,0 +1,9 @@
+target-version = "py311"
+
+[lint]
+# EXE001 (shebang present but file not executable) is disabled: every script
+# in this repo is invoked explicitly as `python path/to/script.py` (see the
+# GitHub Actions workflow), never executed directly, so the executable bit
+# is irrelevant here — and it doesn't survive zip/download/git round trips
+# reliably across operating systems anyway.
+ignore = ["EXE001"]
