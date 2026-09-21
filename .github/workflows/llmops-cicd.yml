@@ -1,0 +1,180 @@
+name: LLMOps CI/CD
+
+on:
+  pull_request:
+    paths:
+      - 'prompts/**'
+      - 'eval/**'
+      - 'app/**'
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: 'Model ID to evaluate/deploy'
+        required: false
+        default: 'claude-sonnet-4-6'
+      skip_to_canary:
+        description: 'Skip staging and go straight to production approval (use with caution)'
+        type: boolean
+        required: false
+        default: false
+
+env:
+  ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  MODEL_ID: "claude-sonnet-4-6"
+  EVAL_SCORE_THRESHOLD: "0.85"
+  MAX_REGRESSION_DROP: "0.05"
+  MAX_COST_PER_REQUEST_USD: "0.05"
+  MAX_P95_LATENCY_MS: "4000"
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1. Standard code + prompt validation
+  # ---------------------------------------------------------------
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Lint code
+        run: |
+          pip install ruff
+          ruff check app/ eval/ scripts/
+
+      - name: Validate prompt templates (schema + variable checks)
+        run: python eval/validate_prompts.py --prompts-dir prompts/
+
+  # ---------------------------------------------------------------
+  # 2. Automated evaluation gate — the LLMOps-specific step
+  # ---------------------------------------------------------------
+  prompt-eval:
+    needs: lint-and-validate
+    runs-on: ubuntu-latest
+    outputs:
+      eval_passed: ${{ steps.eval.outputs.passed }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run golden dataset evaluation
+        id: eval
+        env:
+          RUN_MODEL_ID: ${{ github.event.inputs.model_id || env.MODEL_ID }}
+        run: |
+          python eval/run_eval.py \
+            --dataset eval/golden_dataset.jsonl \
+            --prompt prompts/current_prompt.yaml \
+            --model "$RUN_MODEL_ID" \
+            --baseline eval/baseline_scores.json \
+            --score-threshold "$EVAL_SCORE_THRESHOLD" \
+            --max-regression "$MAX_REGRESSION_DROP" \
+            --max-cost "$MAX_COST_PER_REQUEST_USD" \
+            --max-latency-ms "$MAX_P95_LATENCY_MS" \
+            --output eval/results/latest_run.json
+          echo "passed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Upload eval report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval/results/latest_run.json
+
+      - name: Post eval summary to PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = JSON.parse(fs.readFileSync('eval/results/latest_run.json', 'utf8'));
+            const body = `## LLM Eval Report
+            | Metric | Value | Threshold | Status |
+            |---|---|---|---|
+            | Overall score | ${report.overall_score.toFixed(3)} | ${report.thresholds.score_threshold} | ${report.overall_score >= report.thresholds.score_threshold ? '✅' : '❌'} |
+            | Regression vs baseline | ${report.regression_delta.toFixed(3)} | -${report.thresholds.max_regression} | ${report.regression_delta >= -report.thresholds.max_regression ? '✅' : '❌'} |
+            | Avg cost/request | $${report.avg_cost_usd.toFixed(4)} | $${report.thresholds.max_cost} | ${report.avg_cost_usd <= report.thresholds.max_cost ? '✅' : '❌'} |
+            | P95 latency | ${report.p95_latency_ms.toFixed(0)}ms | ${report.thresholds.max_latency_ms}ms | ${report.p95_latency_ms <= report.thresholds.max_latency_ms ? '✅' : '❌'} |
+            | Safety violations | ${report.safety_violations} | 0 | ${report.safety_violations === 0 ? '✅' : '❌'} |
+            `;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ---------------------------------------------------------------
+  # 3. Staging deploy + shadow traffic (main branch only)
+  # ---------------------------------------------------------------
+  deploy-staging:
+    needs: prompt-eval
+    if: >
+      needs.prompt-eval.outputs.eval_passed == 'true' &&
+      (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') &&
+      github.event.inputs.skip_to_canary != 'true'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy prompt/model version to staging
+        run: python scripts/deploy.py --env staging --version "${{ github.sha }}"
+
+      - name: Run shadow traffic replay
+        run: python scripts/shadow_replay.py --env staging --sample-size 200 --duration-min 15
+
+  # ---------------------------------------------------------------
+  # 4. Manual approval gate for production
+  # ---------------------------------------------------------------
+  approve-production:
+    needs: [prompt-eval, deploy-staging]
+    if: always() && needs.prompt-eval.outputs.eval_passed == 'true' && needs.deploy-staging.result != 'failure'
+    runs-on: ubuntu-latest
+    environment: production-approval
+    steps:
+      - run: echo "Approved for production canary rollout"
+
+  # ---------------------------------------------------------------
+  # 5. Canary rollout with auto-rollback
+  # ---------------------------------------------------------------
+  deploy-prod-canary:
+    needs: approve-production
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy 5% canary
+        run: python scripts/deploy.py --env production --version "${{ github.sha }}" --traffic-pct 5
+
+      - name: Monitor canary and auto-rollback on breach
+        run: |
+          python scripts/monitor_canary.py \
+            --env production \
+            --duration-min 60 \
+            --score-threshold "$EVAL_SCORE_THRESHOLD" \
+            --max-cost "$MAX_COST_PER_REQUEST_USD" \
+            --max-latency-ms "$MAX_P95_LATENCY_MS" \
+            --rollback-on-breach true
+
+  deploy-prod-full:
+    needs: deploy-prod-canary
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - name: Promote to 100% traffic
+        run: python scripts/deploy.py --env production --version "${{ github.sha }}" --traffic-pct 100
